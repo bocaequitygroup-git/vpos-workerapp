@@ -68,9 +68,7 @@
   .pindots span{width:14px;height:14px;border-radius:50%;border:2px solid var(--border);}
   .pindots span.filled{background:var(--accent);border-color:var(--accent);}
 
-  .worker-select{display:flex;flex-direction:column;gap:8px;margin-bottom:16px;}
-  .worker-opt{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;font-size:14px;text-align:left;}
-  .worker-opt.selected{border-color:var(--accent);background:rgba(61,220,132,.08);}
+  #nameSection{display:flex;flex-direction:column;gap:4px;margin-bottom:16px;}
 
   .activity-list{display:flex;flex-direction:column;gap:8px;}
   .activity-opt{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;text-align:left;}
@@ -110,8 +108,12 @@
     <!-- ===================== LOGIN ===================== -->
     <section class="screen active" id="screen-login">
       <h2 class="title">Junction City Ranch</h2>
-      <div class="subtitle">VPOS Worker App — select your name</div>
-      <div class="worker-select" id="workerSelect"></div>
+      <div class="subtitle">VPOS Worker App — enter your name and PIN</div>
+      <div id="nameSection">
+        <label class="field-label" for="nameInput">Name</label>
+        <input type="text" id="nameInput" placeholder="Enter your name" autocomplete="off">
+        <button class="btn" id="nameContinueBtn">Continue</button>
+      </div>
       <div id="pinSection" style="display:none;">
         <div class="subtitle" id="pinPromptLabel">Enter your PIN</div>
         <div class="pindots" id="pinDots"></div>
@@ -327,22 +329,32 @@ function renderConnIndicator(){
 let LIVE_USERS = null; // populated from the live USERS tab once connection is confirmed
 
 function renderWorkerSelect(){
+  // No list is rendered — login is by typed name. This just resets the
+  // name entry field so it's ready for the next person.
+  const input = $('nameInput');
+  if(input) input.value = '';
+  $('nameSection').style.display = 'flex';
+}
+function findUserByName(name){
   const source = LIVE_USERS || SNAPSHOT.USERS || [];
   const users = source.filter(u => (u.Status||'').toUpperCase() === 'ACTIVE');
-  const box = $('workerSelect');
-  box.innerHTML = users.map(u => `
-    <button class="worker-opt" data-id="${esc(u.Worker_ID)}" data-name="${esc(u.Name)}">
-      ${esc(u.Name)} <span style="color:var(--muted);font-size:11px;">· ${esc(u.Role)}</span>
-    </button>`).join('');
-  box.querySelectorAll('.worker-opt').forEach(btn => {
-    btn.addEventListener('click', () => {
-      SELECTED_WORKER = {Worker_ID: btn.dataset.id, Name: btn.dataset.name};
-      $('pinPromptLabel').textContent = `Enter PIN for ${btn.dataset.name}`;
-      $('pinSection').style.display = 'block';
-      PIN_BUFFER = '';
-      renderPinDots();
-    });
-  });
+  const query = (name||'').trim().toLowerCase();
+  if(!query) return null;
+  return users.find(u => (u.Name||'').trim().toLowerCase() === query) || null;
+}
+function onNameContinue(){
+  const name = $('nameInput').value;
+  const user = findUserByName(name);
+  if(!user){
+    toast('Name not found. Check spelling and try again.', true);
+    return;
+  }
+  SELECTED_WORKER = {Worker_ID: user.Worker_ID, Name: user.Name};
+  $('pinPromptLabel').textContent = `Enter PIN for ${user.Name}`;
+  $('nameSection').style.display = 'none';
+  $('pinSection').style.display = 'block';
+  PIN_BUFFER = '';
+  renderPinDots();
 }
 function renderPinPad(){
   const keys = ['1','2','3','4','5','6','7','8','9','','0','⌫'];
@@ -399,6 +411,7 @@ async function logout(){
   CURRENT_USER = null; SELECTED_WORKER = null; PIN_BUFFER = '';
   $('userChip').style.display = 'none';
   $('pinSection').style.display = 'none';
+  $('nameSection').style.display = 'flex';
   renderWorkerSelect();
   showScreen('screen-login');
 }
@@ -718,7 +731,14 @@ $('historyBackBtn').addEventListener('click', goHome);
 $('backToSessionsBtn').addEventListener('click', goHome);
 $('bedBackBtn').addEventListener('click', goScan);
 $('sessionBackBtn').addEventListener('click', goHome);
-$('pinBackBtn').addEventListener('click', () => { $('pinSection').style.display = 'none'; SELECTED_WORKER = null; });
+$('pinBackBtn').addEventListener('click', () => {
+  $('pinSection').style.display = 'none';
+  SELECTED_WORKER = null;
+  PIN_BUFFER = '';
+  renderWorkerSelect();
+});
+$('nameContinueBtn').addEventListener('click', onNameContinue);
+$('nameInput').addEventListener('keydown', (e) => { if(e.key === 'Enter') onNameContinue(); });
 $('cameraToggleBtn').addEventListener('click', () => { QR_SCANNER ? stopQrScanner() : startQrScanner(); });
 $('processScanBtn').addEventListener('click', processScan);
 $('bedSearchInput').addEventListener('input', searchBeds);
