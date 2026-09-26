@@ -54,9 +54,17 @@ input[type=text],input[type=password],input[type=number]{width:100%;padding:13px
 .qa-grid>*{flex:1;}
 .qa-btn{display:flex;flex-direction:column;align-items:center;gap:4px;background:var(--card);border:1.5px solid var(--border);border-radius:var(--radius);padding:12px 4px;font-size:11.5px;font-weight:700;color:var(--text);cursor:pointer;text-align:center;}
 .qa-btn:active{background:rgba(47,107,60,0.12);}
+.qa-btn.sel{border-color:var(--accent);background:rgba(47,107,60,0.12);}
 .qa-icon{font-size:21px;}
 .hist{font-size:13px;color:var(--sub);padding:6px 2px 0;border-top:1px solid var(--border);margin-top:8px;}
 .hist-row{padding:4px 0;}
+.tote-box{font-size:13px;color:var(--sub);background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:8px 10px;margin:8px 0;}
+.tote-box .tote-hd{display:flex;justify-content:space-between;align-items:center;color:var(--text);font-weight:700;}
+.tote-item{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-top:1px solid var(--border);margin-top:4px;}
+.tote-rm{color:var(--warn);cursor:pointer;font-size:12px;font-weight:700;}
+.break-grid{display:flex;gap:8px;margin-top:6px;}
+.break-grid>*{flex:1;}
+.btn.small{padding:8px 12px;font-size:13px;flex:0 0 auto;}
 </style>
 </head>
 <body>
@@ -84,11 +92,11 @@ function handleAuthError(r){
 
 /* ================= Static reference data =================
    Sourced directly from the live VPOS_System.xlsx (BED_MASTER, ACTIVITY_REFERENCE,
-   COHORT_PRODUCTION). No worker-facing read endpoint exists yet on the backend for
-   LIVE bed/cohort/status data, so BED_STATE_SNAPSHOT / COHORT_SNAPSHOT /
-   ACTIVITY_LOG_SNAPSHOT below are this workbook's last-known state, not a live feed
-   -- they need to be replaced by a real "get-bed-detail" / "get-bed-history" route
-   (or refreshed by hand) to stay accurate. BED_MASTER.Zone is not populated for any
+   COHORT_PRODUCTION, MANAGER_QUEUE). No worker-facing read endpoint exists yet on the
+   backend for LIVE bed/cohort/status/queue data, so BED_STATE_SNAPSHOT / COHORT_SNAPSHOT /
+   ACTIVITY_LOG_SNAPSHOT below are this workbook's last-known state, not a live feed --
+   they need to be replaced by real "get-bed-detail" / "get-bed-history" / "get-assigned-tasks"
+   routes (or refreshed by hand) to stay accurate. BED_MASTER.Zone is not populated for any
    bed in the current workbook, so Zone is omitted from the UI until that column has
    real data. */
 const BLOCKS=[['B1','Block 1',55],['B2','Block 2',55],['B3','Block 3',55],['B4','Block 4',55],['Z5','Zone 5',11]];
@@ -99,7 +107,16 @@ const BLOCKS=[['B1','Block 1',55],['B2','Block 2',55],['B3','Block 3',55],['B4',
 // READY/HARVESTING/POST-HARVEST ACTIVITIES/BLOCKED) -- per R02 a confirmed-but-unplanted cohort should
 // read RESERVED. Shown as-is rather than silently relabeled; worth a data-integrity fix upstream.
 const BED_STATE_SNAPSHOT={'B4-01':{status:'ASSIGNED',cohortId:'BET-C01'}};
-const COHORT_SNAPSHOT={'BET-C01':{cropId:'BET',cropName:'Beets'}};
+
+// Cohort_ID -> lifecycle fields, from COHORT_PRODUCTION. actualDob is a plain 'YYYY-MM-DD' string
+// (or null if Actual_DOB is blank, which is currently true for all 124 cohorts in the workbook --
+// nothing has been planted yet. BET-C01 has Assignment_Status=ASSIGNED but no Actual_DOB, i.e.
+// approved-but-not-yet-planted). currentStage mirrors Current_Stage verbatim (null until the sheet
+// has a value, since Current_Stage is blank workbook-wide too); cropDay is intentionally NOT stored
+// here and is instead computed live from actualDob by cropDayFor_() below, since Crop_Day is a moving
+// target every day a cohort stays planted and a snapshot number would go stale immediately.
+const COHORT_SNAPSHOT={'BET-C01':{cropId:'BET',cropName:'Beets',assignmentStatus:'ASSIGNED',
+ currentStage:null,actualDob:null,harvestWindowStart:'2026-04-25',harvestWindowEnd:'2026-05-10'}};
 // Bed_ID -> [{activityName,workerId,endTime|startTime}], from FIELD_ACTIVITY_LOG. Currently empty workbook-wide.
 const ACTIVITY_LOG_SNAPSHOT={};
 
@@ -184,15 +201,148 @@ const QUICK_ACTIONS=[
  {id:'ACT_011',icon:'🌿',label:'Log Weeding'}
 ];
 
+// Full CROP_REFERENCE (40 rows as of the latest upload) -- used only by the Planting
+// branch's crop picker (see PLANTING_ACTIVITY_IDS below), to let a worker name what's
+// going into a bed that has no cohort yet.
+const CROP_REFERENCE=[
+ {id:'MCH',name:'Mchicha',category:'African Leafy Greens'},{id:'AMA-L',name:'Amaranth (Leafy)',category:'African Leafy Greens'},
+ {id:'SUK',name:'Sukuma Wiki',category:'African Leafy Greens'},{id:'MUS',name:'Mustard Greens',category:'African Leafy Greens'},
+ {id:'CHD',name:'Swiss Chard',category:'African Leafy Greens'},{id:'CPL',name:'Cowpea Leaves',category:'African Leafy Greens'},
+ {id:'SPD',name:'Spider Plant',category:'African Leafy Greens'},{id:'BTL',name:'Bitter Leaf',category:'African Leafy Greens'},
+ {id:'UGW',name:'Ugwu',category:'African Leafy Greens'},{id:'SP',name:'Sweet Potatoes',category:'Tropical Tubers & Perennials'},
+ {id:'TY',name:'True Yams',category:'Tropical Tubers & Perennials'},{id:'CAS',name:'Cassava',category:'Tropical Tubers & Perennials'},
+ {id:'PLN',name:'Plantains',category:'Tropical Tubers & Perennials'},{id:'CAR',name:'Carrots',category:'Cool-Season Roots'},
+ {id:'BET',name:'Beets',category:'Cool-Season Roots'},{id:'TUR',name:'Turnips',category:'Cool-Season Roots'},
+ {id:'ONI',name:'Onions',category:'Bulb Crops'},{id:'ASP',name:'Asparagus',category:'Perennial Crown'},
+ {id:'SB',name:'Scotch Bonnet',category:'Warm-Season Fruiting Crops'},{id:'HAB',name:'Habanero',category:'Warm-Season Fruiting Crops'},
+ {id:'BEC',name:'Bird’s Eye Chili',category:'Warm-Season Fruiting Crops'},{id:'BEL',name:'Bell Pepper',category:'Warm-Season Fruiting Crops'},
+ {id:'AFE',name:'African Eggplant',category:'Warm-Season Fruiting Crops'},{id:'EGG',name:'Eggplant',category:'Warm-Season Fruiting Crops'},
+ {id:'TOM',name:'Tomatoes',category:'Warm-Season Fruiting Crops'},{id:'CUC',name:'Cucumber',category:'Warm-Season Fruiting Crops'},
+ {id:'OKR',name:'Okra',category:'Warm-Season Fruiting Crops'},{id:'LET',name:'Lettuce',category:'Cool-Season Brassicas & Greens'},
+ {id:'KAL',name:'Kale',category:'Cool-Season Brassicas & Greens'},{id:'SPI',name:'Spinach',category:'Cool-Season Brassicas & Greens'},
+ {id:'BRO',name:'Broccoli',category:'Cool-Season Brassicas & Greens'},{id:'CAU',name:'Cauliflower',category:'Cool-Season Brassicas & Greens'},
+ {id:'CAB',name:'Cabbage',category:'Cool-Season Brassicas & Greens'},{id:'COL',name:'Collard Greens',category:'Cool-Season Brassicas & Greens'},
+ {id:'AMG',name:'Amaranth Grain',category:'Grain Crops'},{id:'CPG',name:'Cowpea Grain',category:'Grain Crops'},
+ {id:'CLV',name:'Clover',category:'Cover Crops'},{id:'RYE',name:'Rye',category:'Cover Crops'},
+ {id:'VET',name:'Vetch',category:'Cover Crops'},{id:'BKW',name:'Buckwheat',category:'Cover Crops'}
+];
+function cropById(id){return CROP_REFERENCE.find(c=>c.id===id);}
+
+// Scouting vocabulary, locked elsewhere in the project across SCOUT_FINDING/EXCEPTION_LOG.
+const SCOUT_DOMAINS=[['PlantCondition','Plant Condition'],['PestPressure','Pest Pressure'],
+ ['DiseasePressure','Disease Pressure'],['SoilWater','Soil & Water'],['WeedCompetition','Weed & Competition']];
+const SCOUT_SEVERITIES=['LOW','MEDIUM','HIGH','CRITICAL'];
+
+// Worker-raised exceptions mid-task (Active Session "Report Issue" -- distinct from Scout
+// Finding, which is a scouting observation that MAY open an exception. This is the worker
+// directly flagging something blocking or wrong with the task itself). Writes straight to
+// EXCEPTION_LOG via reportException_(), which already exists in ActivityEngine.gs and already
+// takes exactly these fields (Exception_Type/Blocked_Reason/Exception_Notes/Severity/Photo_URL)
+// -- only the 'report-exception' routeAction_ case + AUTH_POLICY entry are new. See the
+// VPOS_Backend_Patch_ExceptionsAndPause.gs addendum.
+const EXCEPTION_TYPES=[['Blocked','Blocked / Cannot Proceed'],['Equipment','Equipment Issue'],
+ ['Safety','Safety Concern'],['CropDamage','Crop / Bed Damage'],['Other','Other']];
+// Severity reuses SCOUT_SEVERITIES -- EXCEPTION_LOG.Severity is the same LOW/MEDIUM/HIGH/CRITICAL
+// vocabulary for both paths, no reason to diverge.
+
+// Break/Lunch/End of Day reason codes for the Active Session Pause action. FIELD_LIVE_SESSION
+// has no dedicated reason column -- the reason rides along on pause-activity as `reason` and
+// (per the backend addendum) gets appended to the existing Pause_Time(s) entry as
+// "<ISO timestamp>|<reason>", so no schema change is needed, just a small pauseActivity_ tweak.
+const BREAK_REASONS=[['Break','☕','Break'],['Lunch','🍽️','Lunch'],['EndOfDay','🏁','End of Day']];
+function breakLabel(code){const b=BREAK_REASONS.find(x=>x[0]===code);return b?b[2]:code;}
+
+/* ---- Select Activity branching (Normal / Planting / Harvest) ----
+ * ACT_006/007/008/009/028 (Planting/DirectSeeding/Transplanting/Replanting/Seeding) put a
+ * NEW crop into the ground -- if the bed has no cohort yet, the worker has to say which crop.
+ * ACT_018 (Harvest) gets an optional read-only look at the cohort's planned harvest window so
+ * the worker can see if they're early/on time/overdue before starting. Everything else is
+ * the plain "pick activity, start task" flow this app already had. */
+function branchFor(activityId){
+ if(PLANTING_ACTIVITY_IDS.includes(activityId))return'planting';
+ if(activityId==='ACT_018')return'harvest';
+ return'normal';
+}
+
 function allBeds(){const out=[];for(const[p,,n]of BLOCKS){for(let i=1;i<=n;i++)out.push(p+'-'+String(i).padStart(2,'0'));}return out;}
 function bedBlock(id){const p=id.split('-')[0];const b=BLOCKS.find(x=>x[0]===p);return b?b[1]:'';}
+
+/* ---- Bed Snapshot helpers (Stage/Day, Planting date, Harvest estimate) ---- */
+function parseDateOnly_(s){return s?new Date(s+'T00:00:00'):null;}
+function fmtDate_(s){const d=parseDateOnly_(s);return d?d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}):null;}
+/** Crop_Day is a moving target once a cohort is planted -- compute it live from Actual_DOB
+ *  rather than trust a snapshot number that goes stale the day after it's taken. */
+function cropDayFor_(cohort){
+ if(!cohort||!cohort.actualDob)return null;
+ const start=parseDateOnly_(cohort.actualDob);
+ return Math.max(1,Math.floor((Date.now()-start.getTime())/86400000)+1);
+}
+function stageLabel_(cohort){
+ if(!cohort)return null;
+ if(cohort.currentStage)return cohort.currentStage;
+ return cohort.actualDob?'Growing':'Pre-Planting';
+}
 function bedDetail(id){
  const snap=BED_STATE_SNAPSHOT[id]||{};
  const status=snap.status||'AVAILABLE';
  const cohortId=snap.cohortId||null;
  const cohort=cohortId?COHORT_SNAPSHOT[cohortId]:null;
- return{bedId:id,block:bedBlock(id),zone:null,status:status,cohortId:cohortId,cropName:cohort?cohort.cropName:null};
+ return{bedId:id,block:bedBlock(id),zone:null,status:status,cohortId:cohortId,
+  cropName:cohort?cohort.cropName:null,
+  assignmentStatus:cohort?cohort.assignmentStatus:null,
+  stage:stageLabel_(cohort),
+  cropDay:cropDayFor_(cohort),
+  plantingDate:cohort?cohort.actualDob:null,
+  harvestStart:cohort?cohort.harvestWindowStart:null,
+  harvestEnd:cohort?cohort.harvestWindowEnd:null};
 }
+
+/* ---- Assigned Tasks (My Active Sessions -> "Start assigned task") ----
+ * A bed whose cohort has been manager-assigned (COHORT_PRODUCTION.Assignment_Status=
+ * 'ASSIGNED', the same underlying event as a resolved MANAGER_QUEUE BED_ASSIGNMENT row)
+ * but not yet planted (no Actual_DOB) is ready for any worker to pick up and plant --
+ * this reads the cohort's own Assignment_Status rather than the queue row's Status so a
+ * task doesn't vanish here the moment a manager approves it, only once it's actually planted.
+ * Not worker-specific: MANAGER_QUEUE/COHORT_PRODUCTION have no Worker_ID column today, so
+ * this is a shared pool ("assigned to the field", not "assigned to Lisa"), same as a
+ * physical job board. Once this device has started (or finished) a planting-domain session
+ * on that bed it drops off the list, so it doesn't keep nagging the same worker.
+ *
+ * LIVE as of this version -- loadAssignedTasks() below calls the 'get-assigned-tasks' route
+ * (see VPOS_Backend_Patch_AssignedTasks.gs) instead of reading the hardcoded
+ * BED_STATE_SNAPSHOT/COHORT_SNAPSHOT constants. Those constants are still used as a fallback
+ * display source for beds this device hasn't heard about live yet (e.g. offline), and get
+ * merged with real data the moment a live fetch succeeds -- see the .forEach() in
+ * loadAssignedTasks(). */
+const PLANTING_ACTIVITY_IDS=['ACT_006','ACT_007','ACT_008','ACT_009','ACT_028'];
+function assignedTasks(){
+ return(st.liveAssignedTasks||[]).filter(t=>!allSessions().some(s=>s.bedId===t.bedId&&PLANTING_ACTIVITY_IDS.includes(s.activityId)));
+}
+/** Fetches the live shared pool of manager-assigned-but-unplanted beds. Quiet on failure
+ *  (no global error banner -- this is a background read, not a worker-initiated action) but
+ *  visible: renderHome() shows a small inline note if the route isn't reachable, same spirit
+ *  as pauseS()/resumeS()'s "not wired up yet" messaging, just scoped to its own section. */
+async function loadAssignedTasks(){
+ if(!st.me)return;
+ st.loadingTasks=true;render();
+ const r=await api('get-assigned-tasks',{});
+ st.loadingTasks=false;
+ if(handleAuthError(r))return;
+ if(!r.ok){ st.liveAssignedTasks=[]; st.assignedTasksUnavailable=true; render(); return; }
+ st.assignedTasksUnavailable=false;
+ st.liveAssignedTasks=(r.data||[]).map(t=>({bedId:t.bedId,block:t.block||bedBlock(t.bedId),cohortId:t.cohortId,
+  cropId:t.cropId,cropName:t.cropName,harvestWindowStart:t.harvestWindowStart||null,harvestWindowEnd:t.harvestWindowEnd||null}));
+ // Merge into the local bed/cohort snapshot so navigating into one of these beds (Start
+ // Planting -> Confirm Assignment) shows real Stage/Cohort/Harvest-est. info (item 2) instead
+ // of the blanks a bed missing from the hardcoded snapshot would otherwise show.
+ st.liveAssignedTasks.forEach(t=>{
+  BED_STATE_SNAPSHOT[t.bedId]=Object.assign({},BED_STATE_SNAPSHOT[t.bedId],{status:'ASSIGNED',cohortId:t.cohortId});
+  COHORT_SNAPSHOT[t.cohortId]=Object.assign({currentStage:null,actualDob:null},COHORT_SNAPSHOT[t.cohortId],
+   {cropId:t.cropId,cropName:t.cropName,assignmentStatus:'ASSIGNED',harvestWindowStart:t.harvestWindowStart,harvestWindowEnd:t.harvestWindowEnd});
+ });
+ render();
+}
+function startAssignedTask(bedId){selectBed(bedId);}
 function fmt(ms){if(ms<0)ms=0;let s=Math.floor(ms/1000);const h=Math.floor(s/3600);s-=h*3600;const m=Math.floor(s/60);s-=m*60;
 return(h>0?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
 function elapsed(s){const paused=s.totalPausedMs||0;if(s.status==='paused')return s.pausedAt-s.startTime-paused;
@@ -210,14 +360,19 @@ function saveSessions(arr){localStorage.setItem('vpos_sessions',JSON.stringify(a
 
 let tickTimer=null;
 let st={screen:'login',me:null,token:null,workerIdInput:'',pinInput:'',err:null,busy:false,connected:false,
- sessions:[],scanQuery:'',selBed:null,selAct:null,showAllActs:false,showHistory:false,completingId:null,qty:'',unit:'',notes:'',isFinal:false};
+ sessions:[],scanQuery:'',selBed:null,selAct:null,selCrop:null,showAllActs:false,showHistory:false,
+ completingId:null,qty:'',unit:'',notes:'',isFinal:false,
+ scoutingId:null,scoutDomain:null,scoutSymptom:'',scoutSeverity:null,scoutNotes:'',scoutRequiresAction:false,scoutPhotoDataUrl:'',
+ exceptioningId:null,excType:null,excSeverity:null,excBlockedReason:'',excNotes:'',excPhotoDataUrl:'',
+ breakPickerId:null,addingToteId:null,toteWeight:'',
+ liveAssignedTasks:[],loadingTasks:false,assignedTasksUnavailable:false};
 
 try{
  const sess=JSON.parse(localStorage.getItem('vpos_session')||'null');
  if(sess&&sess.token&&sess.me){st.me=sess.me;st.token=sess.token;st.screen='home';st.connected=true;}
 }catch(e){}
 function loadForMe(){st.sessions=allSessions().filter(s=>s.workerId===st.me.workerId).sort((a,b)=>b.startTime-a.startTime);}
-if(st.me)loadForMe();
+if(st.me){loadForMe();loadAssignedTasks();}
 
 function go(screen){st.screen=screen;st.err=null;render();}
 
@@ -233,7 +388,7 @@ async function attemptLogin(){
  st.token=r.data.token;
  localStorage.setItem('vpos_session',JSON.stringify({me:st.me,token:st.token}));
  st.workerIdInput='';st.pinInput='';
- loadForMe();go('home');
+ loadForMe();go('home');loadAssignedTasks();
 }
 function doLogout(callServer){
  if(callServer!==false && st.token) api('logout',{device:(navigator.userAgent||'').slice(0,100)});
@@ -247,20 +402,49 @@ function processScan(){
  else st.err='No bed found for "'+st.scanQuery+'". Try Search Beds below.';
  render();
 }
-function selectBed(id){st.selBed=id;st.selAct=null;st.showAllActs=false;st.showHistory=false;go('assignment');}
-function selectAct(id){st.selAct=actById(id);render();}
+function selectBed(id){st.selBed=id;st.selAct=null;st.selCrop=null;st.showAllActs=false;st.showHistory=false;go('assignment');}
+function selectAct(id){st.selAct=actById(id);st.selCrop=null;render();}
+function selectCrop(id){st.selCrop=cropById(id);render();}
+
+/** Planting-branch crop picker only applies when the bed has no cohort yet -- an
+ *  already-planted bed (e.g. Replanting/Thinning) implies its own crop, nothing to pick. */
+function needsCropPick(){
+ return st.selAct&&branchFor(st.selAct.id)==='planting'&&st.selBed&&!bedDetail(st.selBed).cohortId;
+}
+function canStart(){
+ if(!st.selBed||!st.selAct||st.busy)return false;
+ if(needsCropPick()&&!st.selCrop)return false;
+ return true;
+}
 
 async function confirmStart(){
- if(!st.selBed||!st.selAct||st.busy)return;
+ if(!canStart())return;
  st.busy=true;st.err=null;render();
- const r=await api('start-activity',{bedId:st.selBed,activityName:st.selAct.name});
+ let r;
+ if(needsCropPick()){
+  // No cohort on this bed yet -- start-planting creates a minimal COHORT_PRODUCTION row for
+  // the chosen crop and assigns it to the bed server-side, then starts the session in the
+  // same call. See VPOS_Backend_Patch.gs (startPlantingNewCohort_) -- this route does not
+  // exist in the plain start-activity path, which requires an existing cohort on the bed.
+  r=await api('start-planting',{bedId:st.selBed,activityName:st.selAct.name,cropId:st.selCrop.id});
+ }else{
+  r=await api('start-activity',{bedId:st.selBed,activityName:st.selAct.name});
+ }
  st.busy=false;
  if(handleAuthError(r))return;
  if(!r.ok){st.err=r.error||('Could not start that activity ('+(r.code||'error')+').');render();return;}
+ if(r.data.cohortId){
+  // Reflect the new cohort in this device's local snapshot immediately so the Bed Snapshot
+  // card and Assigned Tasks list stay consistent without a reload -- same local-mirror
+  // limitation as the rest of this file (see "Local mirror" note below).
+  BED_STATE_SNAPSHOT[st.selBed]={status:'PLANTED',cohortId:r.data.cohortId};
+  COHORT_SNAPSHOT[r.data.cohortId]={cropId:st.selCrop.id,cropName:st.selCrop.name,assignmentStatus:'ASSIGNED',
+   currentStage:null,actualDob:new Date().toISOString().slice(0,10),harvestWindowStart:null,harvestWindowEnd:null};
+ }
  const arr=allSessions();
  arr.push({id:r.data.sessionId,workerId:st.me.workerId,bedId:st.selBed,block:bedBlock(st.selBed),
   activityId:st.selAct.id,activityName:st.selAct.name,qtyBased:st.selAct.qtyBased,unit:st.selAct.unit,
-  status:'active',startTime:Date.now(),totalPausedMs:0,pausedAt:null});
+  status:'active',startTime:Date.now(),totalPausedMs:0,pausedAt:null,pauseReason:null,totes:[]});
  saveSessions(arr);loadForMe();go('home');
 }
 async function quickStart(id){
@@ -272,29 +456,195 @@ function localUpdate(id,patch){
  const arr=allSessions();const idx=arr.findIndex(s=>s.id===id);if(idx<0)return;
  arr[idx]=Object.assign(arr[idx],patch);saveSessions(arr);loadForMe();
 }
-async function pauseS(id){
- st.err=null;const r=await api('pause-activity',{sessionId:id});
+/* ---- Break / Lunch / End of Day (reason-coded Pause) ----
+ * Tapping Pause now opens a reason picker instead of pausing immediately, so
+ * FIELD_LIVE_SESSION's pause event (once the backend addendum lands) carries WHY,
+ * not just that it happened. Still honest about the missing route: if the server
+ * doesn't confirm, nothing is marked paused locally -- same behavior as before. */
+function openBreakPicker(id){st.breakPickerId=id;render();}
+function closeBreakPicker(){st.breakPickerId=null;render();}
+function breakPickerHtml(id){
+ return `<p class="sub" style="margin:2px 0 4px;">Pausing for…</p>
+ <div class="break-grid">${BREAK_REASONS.map(([code,icon,label])=>
+   `<button class="qa-btn" ${st.busy?'disabled':''} onclick="startBreak('${id}','${code}')"><span class="qa-icon">${icon}</span><span>${esc(label)}</span></button>`).join('')}</div>
+ <p class="link" onclick="closeBreakPicker()">Cancel</p>`;
+}
+async function startBreak(id,code){await pauseS(id,code);}
+async function pauseS(id,reasonCode){
+ st.err=null;st.busy=true;render();
+ const r=await api('pause-activity',{sessionId:id,reason:reasonCode||''});
+ st.busy=false;
  if(handleAuthError(r))return;
  if(!r.ok){st.err='Pause is not wired up on the server yet ('+(r.code||'error')+'). Ask your developer to add a pause-activity route.';render();return;}
- localUpdate(id,{status:'paused',pausedAt:Date.now()});render();
+ st.breakPickerId=null;
+ localUpdate(id,{status:'paused',pausedAt:Date.now(),pauseReason:reasonCode||null});render();
 }
 async function resumeS(id){
- const s=st.sessions.find(x=>x.id===id);st.err=null;
+ const s=st.sessions.find(x=>x.id===id);st.err=null;st.busy=true;render();
  const r=await api('resume-activity',{sessionId:id});
+ st.busy=false;
  if(handleAuthError(r))return;
  if(!r.ok){st.err='Resume is not wired up on the server yet ('+(r.code||'error')+').';render();return;}
- localUpdate(id,{status:'active',pausedAt:null,totalPausedMs:(s.totalPausedMs||0)+(Date.now()-s.pausedAt)});render();
+ localUpdate(id,{status:'active',pausedAt:null,totalPausedMs:(s.totalPausedMs||0)+(Date.now()-s.pausedAt),pauseReason:null});render();
 }
-function openComplete(id){st.completingId=id;st.qty='';st.unit=(st.sessions.find(x=>x.id===id)||{}).unit||'';st.notes='';st.isFinal=false;render();}
+
+/* ---- Harvest Totes (running weigh-ins during one Harvest session) ----
+ * HARVEST_LOG has no per-tote writer on the backend yet (see log-harvest: NOT_IMPLEMENTED
+ * in Code_main.gs), so totes are kept here, on the session, and rolled up into a single
+ * quantity + an itemized note when the worker finally taps Complete -- using the
+ * end-activity route that already works today. Nothing is lost; it's just batched instead
+ * of written as individual HARVEST_LOG rows. A future 'log-harvest-tote' route could write
+ * each tote as its own HARVEST_LOG row (with Grade/ColdChain_Compliant) in real time --
+ * swap addTote()'s local-only append for an api() call once that exists. */
+function toteTotal(s){return(s.totes||[]).reduce((sum,t)=>sum+(Number(t.weight)||0),0);}
+function toteNoteLine(s){
+ const totes=s.totes||[];
+ if(!totes.length)return'';
+ return'Totes: '+totes.map(t=>t.weight).join(', ')+' '+(s.unit||'lbs')+' ('+totes.length+' weigh-ins).';
+}
+function toteSectionHtml(s,logging){
+ const totes=s.totes||[];
+ return `<div class="tote-box">
+  <div class="tote-hd"><span>🧺 Totes: ${totes.length} · ${toteTotal(s)} ${esc(s.unit||'lbs')} total</span>
+  ${s.status!=='completed'?(logging?`<span class="link" style="margin:0;" onclick="cancelToteEntry()">Cancel</span>`
+    :`<span class="link" style="margin:0;" onclick="openToteEntry('${s.id}')">+ Log Tote</span>`):''}</div>
+  ${totes.map((t,i)=>`<div class="tote-item"><span>Tote ${i+1}: ${esc(t.weight)} ${esc(s.unit||'lbs')}</span>
+    <span class="tote-rm" onclick="removeTote('${s.id}',${i})">Remove</span></div>`).join('')}
+  ${logging?`<div class="row" style="margin-top:8px;">
+    <input type="number" inputmode="decimal" placeholder="Weight (${esc(s.unit||'lbs')})" value="${esc(st.toteWeight)}" oninput="st.toteWeight=this.value">
+    <button class="btn small" onclick="addTote('${s.id}')">Add</button></div>`:''}
+ </div>`;
+}
+function openToteEntry(id){st.addingToteId=id;st.toteWeight='';render();}
+function cancelToteEntry(){st.addingToteId=null;st.toteWeight='';render();}
+function addTote(id){
+ const w=parseFloat(st.toteWeight);
+ if(!w||w<=0){st.err='Enter a tote weight greater than 0.';render();return;}
+ const arr=allSessions();const idx=arr.findIndex(s=>s.id===id);if(idx<0)return;
+ arr[idx].totes=(arr[idx].totes||[]).concat([{weight:w,ts:Date.now()}]);
+ saveSessions(arr);loadForMe();st.addingToteId=null;st.toteWeight='';st.err=null;render();
+}
+function removeTote(id,i){
+ const arr=allSessions();const idx=arr.findIndex(s=>s.id===id);if(idx<0)return;
+ arr[idx].totes=(arr[idx].totes||[]).filter((_,j)=>j!==i);
+ saveSessions(arr);loadForMe();render();
+}
+
+function openComplete(id){
+ const s=st.sessions.find(x=>x.id===id)||{};
+ st.completingId=id;st.unit=s.unit||'';st.notes='';st.isFinal=false;
+ // Harvest with totes logged -- pre-fill the final quantity with the running total so the
+ // worker isn't re-adding numbers by hand; still editable in case a correction is needed.
+ st.qty=(s.activityId==='ACT_018'&&s.totes&&s.totes.length)?String(toteTotal(s)):'';
+ render();
+}
 async function confirmComplete(id){
  const s=st.sessions.find(x=>x.id===id);if(!s||st.busy)return;
  st.busy=true;st.err=null;render();
- const r=await api('end-activity',{sessionId:id,quantity:st.qty,unit:st.unit,notes:st.notes,isFinalHarvest:!!st.isFinal});
+ const toteLine=toteNoteLine(s);
+ const finalNotes=[st.notes,toteLine].filter(Boolean).join(' | ');
+ const r=await api('end-activity',{sessionId:id,quantity:st.qty,unit:st.unit,notes:finalNotes,isFinalHarvest:!!st.isFinal});
  st.busy=false;
  if(handleAuthError(r))return;
  if(!r.ok){st.err=r.error||('Could not complete that task ('+(r.code||'error')+').');render();return;}
  localUpdate(id,{status:'completed',endTime:Date.now()});
  st.completingId=null;render();
+}
+
+/* ---- Scout Finding (photo/flag) ----
+ * Writes to the SCOUT_FINDING tab via the new submit-scout-finding route (see
+ * VPOS_Backend_Patch.gs / logScoutFinding_) -- previously that action always returned
+ * NOT_IMPLEMENTED. Requires_Action=true also opens a linked EXCEPTION_LOG row server-side. */
+function openScout(id){
+ st.scoutingId=id;st.scoutDomain=null;st.scoutSymptom='';st.scoutSeverity=null;
+ st.scoutNotes='';st.scoutRequiresAction=false;st.scoutPhotoDataUrl='';render();
+}
+function scoutFormHtml(s){
+ return `
+ <div class="grp-title" style="margin-top:10px;">Domain</div>
+ ${SCOUT_DOMAINS.map(([id,label])=>`<button class="act-btn compact ${st.scoutDomain===id?'sel':''}" onclick="st.scoutDomain='${id}';render()">${esc(label)}</button>`).join('')}
+ <label style="margin-top:8px;">What did you see?</label>
+ <input type="text" placeholder="e.g. yellowing leaf edges" value="${esc(st.scoutSymptom)}" oninput="st.scoutSymptom=this.value">
+ <div class="grp-title" style="margin-top:10px;">Severity</div>
+ <div class="qa-grid">${SCOUT_SEVERITIES.map(sv=>`<button class="qa-btn ${st.scoutSeverity===sv?'sel':''}" onclick="st.scoutSeverity='${sv}';render()"><span>${esc(sv)}</span></button>`).join('')}</div>
+ <label style="margin-top:8px;">Notes (optional)</label>
+ <input type="text" value="${esc(st.scoutNotes)}" oninput="st.scoutNotes=this.value">
+ <div class="chk"><input type="checkbox" id="scoutReq" ${st.scoutRequiresAction?'checked':''} onchange="st.scoutRequiresAction=this.checked"><label for="scoutReq" style="margin:0;">Needs manager attention (opens an exception)</label></div>
+ <label style="margin-top:8px;">Photo (optional)</label>
+ <input type="file" accept="image/*" capture="environment" onchange="onScoutPhoto(event)">
+ ${st.scoutPhotoDataUrl?`<img src="${st.scoutPhotoDataUrl}" style="width:100%;border-radius:var(--radius);margin-top:8px;">`:''}
+ <div class="row">
+   <button class="btn secondary" onclick="st.scoutingId=null;render()">Cancel</button>
+   <button class="btn warn" ${st.busy?'disabled':''} onclick="submitScout('${s.id}')">${st.busy?'Saving…':'Save Finding'}</button>
+ </div>`;
+}
+function onScoutPhoto(e){
+ const f=e.target.files&&e.target.files[0];if(!f)return;
+ if(f.size>1500000){st.err='Photo is too large (max ~1.5MB). Try a smaller photo.';render();return;}
+ const reader=new FileReader();
+ reader.onload=()=>{st.scoutPhotoDataUrl=reader.result;render();};
+ reader.readAsDataURL(f);
+}
+async function submitScout(id){
+ const s=st.sessions.find(x=>x.id===id);if(!s||st.busy)return;
+ if(!st.scoutDomain||!st.scoutSeverity){st.err='Pick a domain and a severity first.';render();return;}
+ st.busy=true;st.err=null;render();
+ const d=bedDetail(s.bedId);
+ const r=await api('submit-scout-finding',{sessionId:id,bedId:s.bedId,cohortId:d.cohortId||'',
+  domain:st.scoutDomain,symptom:st.scoutSymptom,severity:st.scoutSeverity,notes:st.scoutNotes,
+  requiresAction:!!st.scoutRequiresAction,photoDataUrl:st.scoutPhotoDataUrl||''});
+ st.busy=false;
+ if(handleAuthError(r))return;
+ if(!r.ok){st.err=r.error||('Could not save that finding ('+(r.code||'error')+').');render();return;}
+ st.scoutingId=null;render();
+}
+
+/* ---- Report Issue (Active Session exception flag) ----
+ * Worker-initiated exception, mid-task -- e.g. broken tool, blocked bed, safety concern --
+ * as opposed to Scout Finding's crop-observation flow. Writes straight to EXCEPTION_LOG via
+ * the new 'report-exception' route (see VPOS_Backend_Patch_ExceptionsAndPause.gs), which just
+ * calls the reportException_() helper that already exists in ActivityEngine.gs. A HIGH/CRITICAL
+ * severity report also flips the session to EXCEPTION status server-side and raises it on the
+ * manager queue, same as a HIGH/CRITICAL Scout Finding does today. */
+function openException(id){
+ st.exceptioningId=id;st.excType=null;st.excSeverity=null;
+ st.excBlockedReason='';st.excNotes='';st.excPhotoDataUrl='';render();
+}
+function exceptionFormHtml(s){
+ return `
+ <div class="grp-title" style="margin-top:10px;">What's wrong?</div>
+ ${EXCEPTION_TYPES.map(([id,label])=>`<button class="act-btn compact ${st.excType===id?'sel':''}" onclick="st.excType='${id}';render()">${esc(label)}</button>`).join('')}
+ <label style="margin-top:8px;">Details (optional)</label>
+ <input type="text" placeholder="e.g. irrigation valve stuck open" value="${esc(st.excBlockedReason)}" oninput="st.excBlockedReason=this.value">
+ <div class="grp-title" style="margin-top:10px;">Severity</div>
+ <div class="qa-grid">${SCOUT_SEVERITIES.map(sv=>`<button class="qa-btn ${st.excSeverity===sv?'sel':''}" onclick="st.excSeverity='${sv}';render()"><span>${esc(sv)}</span></button>`).join('')}</div>
+ <label style="margin-top:8px;">Notes (optional)</label>
+ <input type="text" value="${esc(st.excNotes)}" oninput="st.excNotes=this.value">
+ <label style="margin-top:8px;">Photo (optional)</label>
+ <input type="file" accept="image/*" capture="environment" onchange="onExceptionPhoto(event)">
+ ${st.excPhotoDataUrl?`<img src="${st.excPhotoDataUrl}" style="width:100%;border-radius:var(--radius);margin-top:8px;">`:''}
+ <div class="row">
+   <button class="btn secondary" onclick="st.exceptioningId=null;render()">Cancel</button>
+   <button class="btn warn" ${st.busy?'disabled':''} onclick="submitException('${s.id}')">${st.busy?'Saving…':'Report Issue'}</button>
+ </div>`;
+}
+function onExceptionPhoto(e){
+ const f=e.target.files&&e.target.files[0];if(!f)return;
+ if(f.size>1500000){st.err='Photo is too large (max ~1.5MB). Try a smaller photo.';render();return;}
+ const reader=new FileReader();
+ reader.onload=()=>{st.excPhotoDataUrl=reader.result;render();};
+ reader.readAsDataURL(f);
+}
+async function submitException(id){
+ const s=st.sessions.find(x=>x.id===id);if(!s||st.busy)return;
+ if(!st.excType||!st.excSeverity){st.err='Pick what kind of issue this is and a severity first.';render();return;}
+ st.busy=true;st.err=null;render();
+ const r=await api('report-exception',{sessionId:id,exceptionType:st.excType,
+  blockedReason:st.excBlockedReason,severity:st.excSeverity,notes:st.excNotes,photoDataUrl:st.excPhotoDataUrl||''});
+ st.busy=false;
+ if(handleAuthError(r))return;
+ if(!r.ok){st.err=r.error||('Could not report that issue ('+(r.code||'error')+').');render();return;}
+ st.exceptioningId=null;render();
 }
 
 function connPill(){
@@ -326,33 +676,54 @@ function renderLogin(){
 function renderHome(){
  const active=st.sessions.filter(s=>s.status==='active'||s.status==='paused');
  const done=st.sessions.filter(s=>s.status==='completed').slice(0,15);
+ const tasks=assignedTasks();
  return `${header()}
  <div class="row" style="margin-bottom:2px;"><h1 style="flex:2;">My Active Sessions</h1>
- <button class="btn secondary" style="flex:1;" onclick="loadForMe();render()">Refresh</button></div>
+ <button class="btn secondary" style="flex:1;" onclick="loadForMe();loadAssignedTasks();render()">Refresh</button></div>
  <p class="sub" style="margin:0 0 10px;">Logged in as ${esc(st.me.name)} (${esc(shortName(st.me.name))})</p>
  ${errBanner()}
- ${active.length===0?'<p class="sub">No active tasks right now. Scan a bed to start one.</p>':
+ ${tasks.length?`
+ <h1 style="font-size:16px;margin:14px 0 6px;">📋 Assigned Tasks</h1>
+ ${tasks.map(t=>`<div class="card">
+   <div style="font-weight:700;">${esc(t.bedId)} · ${esc(t.block)}</div>
+   <div class="sub">${esc(t.cropName)} — assigned to a bed, not yet planted</div>
+   <button class="btn block" style="margin-top:10px;" onclick="startAssignedTask('${t.bedId}')">Start Planting</button>
+ </div>`).join('')}`
+ :st.loadingTasks?`<p class="sub">📋 Checking for assigned tasks…</p>`
+ :st.assignedTasksUnavailable?`<p class="sub">📋 Couldn't load assigned tasks right now (route not reachable) — tap Refresh to retry, or scan a bed directly.</p>`:''}
+ ${active.length===0?`<p class="sub">${tasks.length?'No sessions running yet — start one of the assigned tasks above, or scan a bed.':'No active tasks right now. Scan a bed to start one.'}</p>`:
    active.map(s=>{
     const completing=st.completingId===s.id;
+    const scouting=st.scoutingId===s.id;
+    const exceptioning=st.exceptioningId===s.id;
+    const pickingBreak=st.breakPickerId===s.id;
+    const loggingTote=st.addingToteId===s.id;
+    const isHarvest=s.activityId==='ACT_018';
     return `<div class="card">
     <div class="row" style="margin-bottom:6px;"><div>
-      <span class="badge ${s.status==='paused'?'paused':''}">${s.status.toUpperCase()}</span>
+      <span class="badge ${s.status==='paused'?'paused':''}">${s.status.toUpperCase()}${s.status==='paused'&&s.pauseReason?' · '+esc(breakLabel(s.pauseReason)):''}</span>
       <div style="font-weight:700;margin-top:6px;">${esc(s.bedId)} · ${esc(s.block)}</div>
       <div class="sub">${esc(s.activityName)}</div></div>
       <div class="timer" style="text-align:right;">${fmt(elapsed(s))}</div></div>
+    ${isHarvest?toteSectionHtml(s,loggingTote):''}
     ${completing?`
       ${s.qtyBased?`<label>Quantity (${esc(s.unit)})</label><input type="number" value="${esc(st.qty)}" oninput="st.qty=this.value">`:''}
-      ${s.activityId==='ACT_018'?`<div class="chk"><input type="checkbox" id="finalChk" ${st.isFinal?'checked':''} onchange="st.isFinal=this.checked"><label for="finalChk" style="margin:0;">Final harvest for this cohort</label></div>`:''}
+      ${isHarvest?`<div class="chk"><input type="checkbox" id="finalChk" ${st.isFinal?'checked':''} onchange="st.isFinal=this.checked"><label for="finalChk" style="margin:0;">Final harvest for this cohort</label></div>`:''}
       <label style="margin-top:8px;">Notes (optional)</label><input type="text" value="${esc(st.notes)}" oninput="st.notes=this.value">
       <div class="row">
         <button class="btn secondary" onclick="st.completingId=null;render()">Cancel</button>
         <button class="btn warn" ${st.busy?'disabled':''} onclick="confirmComplete('${s.id}')">${st.busy?'Saving…':'Confirm Complete'}</button>
-      </div>`:`
+      </div>`
+    :scouting?scoutFormHtml(s)
+    :exceptioning?exceptionFormHtml(s)
+    :pickingBreak?breakPickerHtml(s.id):`
       <div class="row">
-        ${s.status==='active'?`<button class="btn secondary" onclick="pauseS('${s.id}')">Pause</button>`
+        ${s.status==='active'?`<button class="btn secondary" onclick="openBreakPicker('${s.id}')">Pause</button>`
           :`<button class="btn secondary" onclick="resumeS('${s.id}')">Resume</button>`}
         <button class="btn warn" onclick="openComplete('${s.id}')">Complete</button>
-      </div>`}
+      </div>
+      <button class="btn secondary block" style="margin-top:8px;" onclick="openScout('${s.id}')">🚩 Scout Finding</button>
+      <button class="btn secondary block" style="margin-top:8px;" onclick="openException('${s.id}')">🚨 Report Issue</button>`}
     </div>`;}).join('')}
  <button class="btn block" style="margin:14px 0;" onclick="startNewTask()">+ Start New Task</button>
  <h1>Completed History</h1>
@@ -403,8 +774,36 @@ function actGroupsHtml(){
   ${g.items.map(it=>`<button class="act-btn compact ${st.selAct&&st.selAct.id===it.id?'sel':''}" onclick="selectAct('${it.id}')">${esc(it.label)}</button>`).join('')}`
  ).join('');
 }
+function cropPickerHtml(){
+ const groups={};
+ CROP_REFERENCE.forEach(c=>{(groups[c.category]=groups[c.category]||[]).push(c);});
+ return `<div class="card">
+  <div style="font-weight:700;margin-bottom:6px;">🌱 What's being planted?</div>
+  <p class="sub" style="margin:0 0 8px;">This bed has no cohort yet -- pick a crop to plant.</p>
+  ${Object.keys(groups).map(cat=>`
+   <div class="grp-title">${esc(cat)}</div>
+   ${groups[cat].map(c=>`<button class="act-btn compact ${st.selCrop&&st.selCrop.id===c.id?'sel':''}" onclick="selectCrop('${c.id}')">${esc(c.name)}</button>`).join('')}`
+  ).join('')}
+ </div>`;
+}
+function harvestWindowHtml(){
+ const d=bedDetail(st.selBed);
+ if(!d.cohortId)return`<div class="card"><p class="sub" style="margin:0;">No cohort on this bed -- nothing planned to harvest here yet.</p></div>`;
+ if(!d.harvestStart)return`<div class="card"><p class="sub" style="margin:0;">No planned harvest window on file for ${esc(d.cohortId)}. You can still log the harvest.</p></div>`;
+ const today=new Date();today.setHours(0,0,0,0);
+ const start=parseDateOnly_(d.harvestStart),end=parseDateOnly_(d.harvestEnd);
+ let badge='Upcoming',cls='';
+ if(today>end){badge='Overdue by '+Math.round((today-end)/86400000)+'d';cls='paused';}
+ else if(today>=start){badge='Ready';}
+ else{badge='In '+Math.round((start-today)/86400000)+'d';}
+ return `<div class="card">
+  <div style="font-weight:700;">🌾 Planned Harvest Window <span class="badge ${cls}" style="margin-left:6px;">${esc(badge)}</span></div>
+  <div class="detail-row">${esc(fmtDate_(d.harvestStart))} – ${esc(fmtDate_(d.harvestEnd))}${d.cropDay?' · Day '+d.cropDay:''}</div>
+ </div>`;
+}
 function renderAssignment(){
  const d=bedDetail(st.selBed);
+ const branch=st.selAct?branchFor(st.selAct.id):'normal';
  const quick=QUICK_ACTIONS.map(q=>{
   const a=actById(q.id);if(!a)return'';
   return `<button class="qa-btn" ${st.busy?'disabled':''} onclick="quickStart('${a.id}')"><span class="qa-icon">${q.icon}</span><span>${esc(q.label)}</span></button>`;
@@ -417,6 +816,10 @@ function renderAssignment(){
   <div class="detail-row">🌱 Crop: ${d.cropName?esc(d.cropName):'—'}</div>
   <div class="detail-row">🏷️ Cohort: ${d.cohortId?esc(d.cohortId):'—'}</div>
   <div class="detail-row">📋 Field Status: ${esc(d.status)}</div>
+  ${d.cohortId?`
+  <div class="detail-row">🔄 Stage: ${d.stage?esc(d.stage)+(d.cropDay?' · Day '+d.cropDay:''):'—'}</div>
+  <div class="detail-row">📅 Planted: ${d.plantingDate?esc(fmtDate_(d.plantingDate)):'Not yet planted'}</div>
+  <div class="detail-row">🌾 Harvest est.: ${d.harvestStart?esc(fmtDate_(d.harvestStart))+' – '+esc(fmtDate_(d.harvestEnd)):'—'}</div>`:''}
   <p class="link" style="margin-top:10px;margin-bottom:0;" onclick="st.showHistory=!st.showHistory;render()">${st.showHistory?'▾':'▸'} Bed History</p>
   ${st.showHistory?bedHistoryHtml(d.bedId):''}
  </div>
@@ -425,7 +828,9 @@ function renderAssignment(){
  <div class="qa-grid">${quick}</div>
  <p class="link" onclick="st.showAllActs=!st.showAllActs;render()">${st.showAllActs?'▾':'▸'} Or Choose Any Activity</p>
  ${st.showAllActs?`<div class="act-groups">${actGroupsHtml()}</div>`:''}
- <button class="btn block" style="margin-top:10px;" ${st.selAct&&!st.busy?'':'disabled'} onclick="confirmStart()">${st.busy?'Starting…':'▶ Start Task'}</button>
+ ${branch==='planting'&&needsCropPick()?cropPickerHtml():''}
+ ${branch==='harvest'?harvestWindowHtml():''}
+ <button class="btn block" style="margin-top:10px;" ${canStart()?'':'disabled'} onclick="confirmStart()">${st.busy?'Starting…':(needsCropPick()&&!st.selCrop?'Pick a crop first':'▶ Start Task')}</button>
  <button class="btn secondary block" style="margin-top:8px;" onclick="go('scan')">Cancel / Rescan</button>
  <p class="link" onclick="go('home')">‹ Back to My Sessions</p>`;
 }
