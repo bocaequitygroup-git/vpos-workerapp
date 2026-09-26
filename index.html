@@ -40,6 +40,10 @@ input[type=text],input[type=password],input[type=number]{width:100%;padding:13px
 .banner{background:var(--warn);color:#fff;padding:10px 12px;border-radius:var(--radius);font-size:13px;margin-bottom:10px;}
 .act-btn{display:block;width:100%;text-align:left;background:var(--card);border:1.5px solid var(--border);border-radius:var(--radius);padding:13px;margin-bottom:8px;font-size:15px;color:var(--text);cursor:pointer;}
 .act-btn.sel{border-color:var(--accent);background:rgba(47,107,60,0.12);}
+.act-groups{margin-top:4px;}
+.grp-title{font-size:11px;font-weight:800;letter-spacing:.03em;text-transform:uppercase;color:var(--sub);margin:14px 0 6px;}
+.grp-title:first-child{margin-top:4px;}
+.act-btn.compact{padding:10px 12px;margin-bottom:6px;font-size:14px;}
 .chk{display:flex;align-items:center;gap:8px;margin-top:8px;font-size:14px;}
 .conn-pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:var(--accent);background:rgba(47,107,60,0.12);padding:4px 10px;border-radius:20px;margin-bottom:10px;}
 .conn-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);}
@@ -99,8 +103,10 @@ const COHORT_SNAPSHOT={'BET-C01':{cropId:'BET',cropName:'Beets'}};
 // Bed_ID -> [{activityName,workerId,endTime|startTime}], from FIELD_ACTIVITY_LOG. Currently empty workbook-wide.
 const ACTIVITY_LOG_SNAPSHOT={};
 
-// From ACTIVITY_REFERENCE (23 rows). workerExec mirrors Is_Worker_Executable exactly --
-// only ACT_021 StateChange is manager-only and excluded from the worker picklist.
+// Full ACTIVITY_REFERENCE (36 rows as of the latest upload). workerExec mirrors
+// Is_Worker_Executable exactly -- only ACT_021 StateChange is manager-only. This is the
+// complete source-of-truth list; WORKER_ACTIVITY_GROUPS below (not this array) decides
+// what the worker picklist actually shows and how it's grouped.
 const ACTIVITIES=[
  {id:'ACT_001',name:'FieldPrep',domain:'Prep',qtyBased:false,unit:'',workerExec:true},
  {id:'ACT_002',name:'BedShaping',domain:'Prep',qtyBased:false,unit:'',workerExec:true},
@@ -124,17 +130,57 @@ const ACTIVITIES=[
  {id:'ACT_020',name:'FieldTurnover',domain:'Harvest',qtyBased:false,unit:'',workerExec:true},
  {id:'ACT_021',name:'StateChange',domain:'State',qtyBased:false,unit:'',workerExec:false},
  {id:'ACT_022',name:'CropCleanup',domain:'State',qtyBased:false,unit:'',workerExec:true},
- {id:'ACT_023',name:'Scouting',domain:'State',qtyBased:false,unit:'',workerExec:true}
+ {id:'ACT_023',name:'Scouting',domain:'State',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_024',name:'LandPrep',domain:'Prep',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_025',name:'Tillage',domain:'Prep',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_026',name:'BedForming',domain:'Prep',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_027',name:'Solarization',domain:'Prep',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_028',name:'Seeding',domain:'Planting',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_029',name:'Cultivation',domain:'CropCare',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_030',name:'Fertilization',domain:'CropCare',qtyBased:true,unit:'lbs',workerExec:true},
+ {id:'ACT_031',name:'Irrigation',domain:'CropCare',qtyBased:true,unit:'gal',workerExec:true},
+ {id:'ACT_032',name:'PestScouting',domain:'State',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_033',name:'DiseaseScouting',domain:'State',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_034',name:'CropInspection',domain:'State',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_035',name:'MaturityInspection',domain:'Harvest',qtyBased:false,unit:'',workerExec:true},
+ {id:'ACT_036',name:'HarvestPrep',domain:'Harvest',qtyBased:false,unit:'',workerExec:true}
 ];
 function actById(id){return ACTIVITIES.find(a=>a.id===id);}
 
-// Field Actions shortcuts. NOTE: ACTIVITY_REFERENCE has no literal "apply/run water" activity --
-// IrrigationCheck ("Validate irrigation performance and detect anomalies") is the closest CropCare-stage
-// match to "Log Water Pass" and is used here as a best guess. Please confirm this is the intended
-// mapping (or tell me the correct Activity_ID) before relying on it.
+// The worker-facing picklist. Deliberately NOT all 36 ACTIVITY_REFERENCE rows --
+// this is the curated/grouped set (verified against the live tab), leaving out the
+// older activities their own Notes column marks as superseded by a newer row:
+// FieldPrep->LandPrep, BedShaping->BedForming, DirectSeeding->Seeding, Fertilizing->Fertilization,
+// plus Mulching, TrellisingSetup, IrrigationSetup, generic Planting, PostHarvestCleanup,
+// generic Scouting, and the manager-only StateChange.
+const WORKER_ACTIVITY_GROUPS=[
+ {title:'Field Preparation',items:[
+   {id:'ACT_024',label:'Land Prep'},{id:'ACT_025',label:'Tillage'},
+   {id:'ACT_026',label:'Bed Forming'},{id:'ACT_027',label:'Solarization'}]},
+ {title:'Planting / Establishment',items:[
+   {id:'ACT_028',label:'Seeding'},{id:'ACT_008',label:'Transplanting'},
+   {id:'ACT_010',label:'Thinning'},{id:'ACT_009',label:'Replanting'}]},
+ {title:'Crop Maintenance',items:[
+   {id:'ACT_029',label:'Cultivation'},{id:'ACT_011',label:'Weeding'},
+   {id:'ACT_017',label:'Trellising'},{id:'ACT_016',label:'Pruning'},
+   {id:'ACT_030',label:'Fertilization'},{id:'ACT_031',label:'Irrigation'},
+   {id:'ACT_013',label:'Irrigation Check'}]},
+ {title:'Scouting / Protection',items:[
+   {id:'ACT_032',label:'Pest Scouting'},{id:'ACT_033',label:'Disease Scouting'},
+   {id:'ACT_014',label:'Pest Control'},{id:'ACT_015',label:'Disease Control'},
+   {id:'ACT_034',label:'Crop Inspection'},{id:'ACT_035',label:'Maturity Inspection'}]},
+ {title:'Harvest',items:[
+   {id:'ACT_036',label:'Harvest Prep'},{id:'ACT_018',label:'Harvest'}]},
+ {title:'Turnover',items:[
+   {id:'ACT_022',label:'Crop Cleanup'},{id:'ACT_020',label:'Field Turnover'}]}
+];
+
+// Field Actions shortcuts -- now mapped to the real, literal activities confirmed in
+// the updated ACTIVITY_REFERENCE: ACT_031 Irrigation is the actual watering event
+// (qty-based, gal), resolving the earlier guess against IrrigationCheck.
 const QUICK_ACTIONS=[
- {id:'ACT_013',icon:'💧',label:'Log Water Pass'},
- {id:'ACT_012',icon:'🧪',label:'Log Fertilizer'},
+ {id:'ACT_031',icon:'💧',label:'Log Water Pass'},
+ {id:'ACT_030',icon:'🧪',label:'Log Fertilizer'},
  {id:'ACT_011',icon:'🌿',label:'Log Weeding'}
 ];
 
@@ -351,9 +397,14 @@ function bedHistoryHtml(bedId){
  return '<div class="hist">'+rows.map(r=>`<div class="hist-row">${esc(r.activityName)} — ${esc(r.workerId)} (${new Date(r.endTime||r.startTime).toLocaleDateString()})</div>`).join('')+'</div>';
 }
 
+function actGroupsHtml(){
+ return WORKER_ACTIVITY_GROUPS.map(g=>`
+  <div class="grp-title">${esc(g.title)}</div>
+  ${g.items.map(it=>`<button class="act-btn compact ${st.selAct&&st.selAct.id===it.id?'sel':''}" onclick="selectAct('${it.id}')">${esc(it.label)}</button>`).join('')}`
+ ).join('');
+}
 function renderAssignment(){
  const d=bedDetail(st.selBed);
- const worker=ACTIVITIES.filter(a=>a.workerExec);
  const quick=QUICK_ACTIONS.map(q=>{
   const a=actById(q.id);if(!a)return'';
   return `<button class="qa-btn" ${st.busy?'disabled':''} onclick="quickStart('${a.id}')"><span class="qa-icon">${q.icon}</span><span>${esc(q.label)}</span></button>`;
@@ -373,7 +424,7 @@ function renderAssignment(){
  <h1 style="font-size:16px;margin-top:16px;">Field Actions</h1>
  <div class="qa-grid">${quick}</div>
  <p class="link" onclick="st.showAllActs=!st.showAllActs;render()">${st.showAllActs?'▾':'▸'} Or Choose Any Activity</p>
- ${st.showAllActs?worker.map(a=>`<button class="act-btn ${st.selAct&&st.selAct.id===a.id?'sel':''}" onclick="selectAct('${a.id}')">${esc(a.name)}</button>`).join(''):''}
+ ${st.showAllActs?`<div class="act-groups">${actGroupsHtml()}</div>`:''}
  <button class="btn block" style="margin-top:10px;" ${st.selAct&&!st.busy?'':'disabled'} onclick="confirmStart()">${st.busy?'Starting…':'▶ Start Task'}</button>
  <button class="btn secondary block" style="margin-top:8px;" onclick="go('scan')">Cancel / Rescan</button>
  <p class="link" onclick="go('home')">‹ Back to My Sessions</p>`;
