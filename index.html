@@ -112,7 +112,7 @@
         <label class="field-label" for="useridInput">User ID</label>
         <input type="text" id="useridInput" placeholder="e.g. lisa" autocomplete="off">
         <label class="field-label" for="pinInput">PIN</label>
-        <input type="password" id="pinInput" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="4-digit PIN" autocomplete="off">
+        <input type="password" id="pinInput" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="4-8 digit PIN" autocomplete="off">
         <button class="btn" id="signInBtn">Sign In</button>
       </div>
     </section>
@@ -155,10 +155,6 @@
       <div class="card" id="bedInfoCard"></div>
       <div class="subtitle">Select an activity</div>
       <div class="activity-list" id="activityList"></div>
-      <div id="quantitySection" style="display:none;margin-top:10px;">
-        <label class="field-label" id="quantityLabel">Quantity</label>
-        <input type="number" id="quantityInput" inputmode="decimal" placeholder="0">
-      </div>
       <button class="btn" id="startSessionBtn" style="margin-top:14px;" disabled>Start Task</button>
       <button class="btn ghost" id="bedBackBtn">Back to Scan</button>
     </section>
@@ -236,16 +232,21 @@ const DEFAULT_EXEC_URL = 'https://script.google.com/macros/s/AKfycbw0dOXaMs3iykT
 // State
 // ============================================================
 let EXEC_URL = localStorage.getItem('vpos_worker_exec_url') || DEFAULT_EXEC_URL;
+const APP_KEY = 'WorkerApp';   // must match AUTH.APP_ROLES key in Auth.gs
 let ONLINE = false;
+let AUTH_TOKEN = null;        // session token returned by authLogin_, sent on every call after login
 let CURRENT_USER = null;      // {Worker_ID, Name, Role}
-let SELECTED_WORKER = null;   // during login flow, before PIN
-let PIN_BUFFER = '';
-let OPEN_SESSIONS = [];
+let PENDING_LOGIN = null;     // {workerId, pin} captured by onSignIn, consumed by attemptLogin
+let OPEN_SESSIONS = [];       // client-tracked only — the backend has no "list my open sessions" action yet
+let LOCAL_HISTORY = [];       // client-tracked completed tasks this session — no worker-facing history endpoint exists yet
 let ACTIVE_SESSION = null;    // session currently being timed on screen-session
+let COMPLETE_UNIT = '';       // Default_Unit for the active session's activity, shown/sent on Complete
 let SELECTED_BED = null;
 let SELECTED_ACTIVITY = null;
 let TIMER_HANDLE = null;
 let QR_SCANNER = null;
+
+function deviceLabel_(){ return (navigator.userAgent || 'WorkerApp').slice(0, 120); }
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s===undefined||s===null) ? '' : String(s).replace(/[&<>]/g, c=>({'&':'&lt;','>':'&gt;','&':'&amp;'}[c]||c));
@@ -263,22 +264,34 @@ function toast(msg, isError){
 }
 
 // ============================================================
-// API layer — talks to the Apps Script Web App; every call falls
-// back to reading/simulating against SNAPSHOT when offline so the
-// app is still browsable without a live connection.
+// API layer — talks to the Apps Script Web App.
+//
+// Code_main.gs's doGet() is a plain health check only — it does not route
+// actions, so it's used purely to detect connectivity. Every real action
+// (including login/logout/whoami) goes through doPost() as POST with a
+// JSON body: {action, ...payload}. Once logged in, every call after
+// 'login' has the session token attached automatically — Auth.gs's
+// authGuard_() rejects anything else with UNAUTHENTICATED.
+//
+// There is no offline fallback for server actions anymore: SNAPSHOT is
+// only used to browse bed data and pick activities locally (there is no
+// bed-search or bed-lookup action on the backend), and, when offline, to
+// let you open the app as a known worker without a real session.
 // ============================================================
-async function apiGet(action, params){
-  params = params || {};
-  const usp = new URLSearchParams(Object.assign({action}, params));
-  const res = await fetch(EXEC_URL + '?' + usp.toString());
+async function pingServer(){
+  const res = await fetch(EXEC_URL, {method:'GET'});
   if(!res.ok) throw new Error('HTTP ' + res.status);
   return res.json();
 }
 async function apiPost(action, body){
+  const payload = Object.assign({action}, body || {});
+  if(AUTH_TOKEN && action !== 'login'){
+    payload.token = AUTH_TOKEN;
+  }
   const res = await fetch(EXEC_URL, {
     method:'POST',
     headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify(Object.assign({action}, body))
+    body: JSON.stringify(payload)
   });
   if(!res.ok) throw new Error('HTTP ' + res.status);
   return res.json();
@@ -286,31 +299,12 @@ async function apiPost(action, body){
 
 async function checkConnection(){
   try{
-    const json = await apiGet('ping');
+    const json = await pingServer();
     ONLINE = !!(json && json.ok);
   } catch(err){
     ONLINE = false;
   }
   renderConnIndicator();
-  if(ONLINE){
-    await refreshLiveUsers();
-  }
-}
-
-async function refreshLiveUsers(){
-  try{
-    const res = await apiGet('users');
-    if(res && res.success){
-      LIVE_USERS = res.users || [];
-      // Only re-render the picker if we're still on the login screen —
-      // don't yank the list out from under someone mid-PIN-entry.
-      if($('screen-login').classList.contains('active') && !SELECTED_WORKER){
-        renderWorkerSelect();
-      }
-    }
-  } catch(err){
-    // Live fetch failed after all — keep whatever list is already showing.
-  }
 }
 function renderConnIndicator(){
   const el = $('connIndicator');
@@ -321,8 +315,6 @@ function renderConnIndicator(){
 // ============================================================
 // Login
 // ============================================================
-let LIVE_USERS = null; // populated from the live USERS tab once connection is confirmed
-
 function renderWorkerSelect(){
   // No list is rendered — login is a plain User ID + PIN form. This just
   // clears the fields so they're ready for the next person.
@@ -331,9 +323,12 @@ function renderWorkerSelect(){
   if(idInput) idInput.value = '';
   if(pinInput) pinInput.value = '';
 }
-function findUser(idOrName){
-  const source = LIVE_USERS || SNAPSHOT.USERS || [];
-  const users = source.filter(u => (u.Status||'').toUpperCase() === 'ACTIVE');
+/** Offline-only: Auth.gs can't be reached, so this just checks the bundled
+ *  snapshot so the app is still browsable. It grants no real session/token,
+ *  so nothing that requires auth (start-activity, end-activity, ...) will
+ *  work until you're back online and sign in for real. */
+function findLocalUser_(idOrName){
+  const users = (SNAPSHOT.USERS || []).filter(u => (u.Status||'').toUpperCase() === 'ACTIVE');
   const query = (idOrName||'').trim().toLowerCase();
   if(!query) return null;
   return users.find(u =>
@@ -342,32 +337,38 @@ function findUser(idOrName){
   ) || null;
 }
 async function onSignIn(){
-  const idVal = $('useridInput').value;
+  const idVal = $('useridInput').value.trim();
   const pinVal = $('pinInput').value;
-  if(!idVal.trim()){ toast('Enter your User ID', true); return; }
-  if(!/^\d{4}$/.test(pinVal)){ toast('PIN must be 4 digits', true); return; }
-  const user = findUser(idVal);
-  if(!user){
-    toast('User ID not found', true);
-    return;
-  }
-  SELECTED_WORKER = {Worker_ID: user.Worker_ID, Name: user.Name};
-  PIN_BUFFER = pinVal;
+  if(!idVal){ toast('Enter your worker ID and PIN', true); return; }
+  if(!/^\d{4,8}$/.test(pinVal)){ toast('PIN must be 4-8 digits', true); return; }
+  PENDING_LOGIN = {workerId: idVal, pin: pinVal};
   await attemptLogin();
 }
 async function attemptLogin(){
   if(!ONLINE){
-    // Offline demo mode: any 4-digit PIN logs in as the selected worker.
-    CURRENT_USER = SELECTED_WORKER;
+    const local = findLocalUser_(PENDING_LOGIN.workerId);
+    if(!local){ toast('Offline — worker not found in bundled data', true); return; }
+    AUTH_TOKEN = null; // no real session while offline
+    CURRENT_USER = {Worker_ID: local.Worker_ID, Name: local.Name, Role: local.Role};
     onLoginSuccess();
     return;
   }
   try{
-    const res = await apiPost('login', {worker_id: SELECTED_WORKER.Worker_ID, pin: PIN_BUFFER});
-    if(res.success){
-      CURRENT_USER = {Worker_ID: SELECTED_WORKER.Worker_ID, Name: res.name || SELECTED_WORKER.Name, Role: res.role};
+    // authLogin_ expects workerId/pin/app (camelCase) and PUBLIC-policy —
+    // it takes no token. On success it returns {token, workerId, name, role, ...}.
+    const res = await apiPost('login', {
+      workerId: PENDING_LOGIN.workerId,
+      pin: PENDING_LOGIN.pin,
+      app: APP_KEY,
+      device: deviceLabel_()
+    });
+    if(res.ok){
+      AUTH_TOKEN = res.data.token;
+      CURRENT_USER = {Worker_ID: res.data.workerId, Name: res.data.name, Role: res.data.role};
       onLoginSuccess();
     } else {
+      // authFail_ shape: {ok:false, error, code}. LOCKED/INACTIVE/ROLE_NOT_ALLOWED
+      // all come through res.error already worded for the person signing in.
       toast(res.error || 'Incorrect PIN', true);
       $('pinInput').value = '';
     }
@@ -377,16 +378,20 @@ async function attemptLogin(){
   }
 }
 function onLoginSuccess(){
+  PENDING_LOGIN = null;
   $('userChip').style.display = 'flex';
   $('userNameLabel').textContent = CURRENT_USER.Name;
   $('loggedInAsLabel').textContent = `Logged in as ${CURRENT_USER.Name}`;
   goHome();
 }
 async function logout(){
-  if(ONLINE && CURRENT_USER){
-    try{ await apiPost('logout', {worker_id: CURRENT_USER.Worker_ID}); } catch(err){}
+  if(ONLINE && AUTH_TOKEN){
+    try{ await apiPost('logout', {token: AUTH_TOKEN, device: deviceLabel_()}); } catch(err){}
   }
-  CURRENT_USER = null; SELECTED_WORKER = null; PIN_BUFFER = '';
+  AUTH_TOKEN = null;
+  CURRENT_USER = null;
+  OPEN_SESSIONS = [];
+  LOCAL_HISTORY = [];
   $('userChip').style.display = 'none';
   renderWorkerSelect();
   showScreen('screen-login');
@@ -400,18 +405,10 @@ async function goHome(){
   await loadOpenSessions();
 }
 async function loadOpenSessions(){
-  if(ONLINE){
-    try{
-      const res = await apiGet('my-sessions', {worker_id: CURRENT_USER.Worker_ID});
-      OPEN_SESSIONS = res.sessions || [];
-    } catch(err){
-      toast('Could not refresh sessions', true);
-      OPEN_SESSIONS = [];
-    }
-  } else {
-    OPEN_SESSIONS = (SNAPSHOT.FIELD_LIVE_SESSION || []).filter(s =>
-      s.Worker_ID === CURRENT_USER.Worker_ID && ['ACTIVE','PAUSED'].includes((s.Status||'').toUpperCase()));
-  }
+  // No backend action exists to list a worker's open sessions (only
+  // start-activity/end-activity are wired up for WorkerApp), so this is
+  // whatever this device has started since the page was last loaded.
+  // Reloading the app loses this list until that action is added.
   renderSessions();
 }
 function renderSessions(){
@@ -474,38 +471,24 @@ async function processScan(){
   const bedId = raw.replace(/^BED:/i, '').trim();
   await lookupBed(bedId);
 }
-async function lookupBed(bedId){
-  let bed = null;
-  if(ONLINE){
-    try{
-      const res = await apiGet('scan', {code: bedId});
-      bed = res.bed || null;
-      if(!bed){ toast(res.error || 'Bed not found', true); return; }
-    } catch(err){
-      toast('Scan failed: ' + err.message, true); return;
-    }
-  } else {
-    bed = (SNAPSHOT.BED_MASTER || []).find(b => (b.Bed_ID||'').toUpperCase() === bedId.toUpperCase());
-    if(!bed){ toast('Bed not found in snapshot', true); return; }
-  }
+function lookupBed(bedId){
+  // scan-bed exists as an action name in Auth.gs's policy but routeAction_
+  // returns NOT_IMPLEMENTED for it (no QR/bed lookup function is wired up
+  // yet), so this reads the bundled BED_MASTER snapshot directly instead.
+  const bed = (SNAPSHOT.BED_MASTER || []).find(b => (b.Bed_ID||'').toUpperCase() === bedId.toUpperCase());
+  if(!bed){ toast('Bed not found', true); return; }
   openBedDetail(bed);
 }
-async function searchBeds(){
+function searchBeds(){
   const q = $('bedSearchInput').value.trim();
   if(q.length < 1){ $('bedSearchResults').innerHTML = ''; return; }
-  let results = [];
-  if(ONLINE){
-    try{
-      const res = await apiGet('search-beds', {q});
-      results = res.beds || [];
-    } catch(err){ results = []; }
-  } else {
-    const uq = q.toUpperCase();
-    results = (SNAPSHOT.BED_MASTER || []).filter(b =>
-      (b.Bed_ID||'').toUpperCase().includes(uq) ||
-      (b.Block_ID||'').toUpperCase().includes(uq) ||
-      (b.Zone||'').toUpperCase().includes(uq)).slice(0,15);
-  }
+  // No search-beds action exists on the backend — search the bundled
+  // BED_MASTER snapshot locally instead.
+  const uq = q.toUpperCase();
+  const results = (SNAPSHOT.BED_MASTER || []).filter(b =>
+    (b.Bed_ID||'').toUpperCase().includes(uq) ||
+    (b.Block_ID||'').toUpperCase().includes(uq) ||
+    (b.Zone||'').toUpperCase().includes(uq)).slice(0,15);
   $('bedSearchResults').innerHTML = results.map(b => `
     <div class="bed-result" onclick='selectSearchedBed(${JSON.stringify(b.Bed_ID)})'>
       <b>${esc(b.Bed_ID)}</b>
@@ -544,30 +527,31 @@ function openBedDetail(bed){
       $('activityList').querySelectorAll('.activity-opt').forEach(b => b.classList.remove('selected'));
       btn.classList.add('selected');
       SELECTED_ACTIVITY = {name: btn.dataset.name, qtyBased: btn.dataset.qty === '1', unit: btn.dataset.unit};
-      $('quantitySection').style.display = SELECTED_ACTIVITY.qtyBased ? 'block' : 'none';
-      $('quantityLabel').textContent = 'Quantity' + (SELECTED_ACTIVITY.unit ? ' (' + SELECTED_ACTIVITY.unit + ')' : '');
       $('startSessionBtn').disabled = false;
     });
   });
   $('startSessionBtn').disabled = true;
-  $('quantitySection').style.display = 'none';
   showScreen('screen-bed');
 }
 async function startSession(){
   if(!SELECTED_ACTIVITY) return;
-  const qty = SELECTED_ACTIVITY.qtyBased ? $('quantityInput').value : null;
-  let sessionId = 'SESS-' + Date.now();
-  if(ONLINE){
+  let sessionId = 'local-' + Date.now();
+  if(ONLINE && AUTH_TOKEN){
     try{
-      const res = await apiPost('start-session', {
-        worker_id: CURRENT_USER.Worker_ID,
-        bed_id: SELECTED_BED.Bed_ID,
-        activity_name: SELECTED_ACTIVITY.name,
-        quantity: qty
+      // start-activity(auth.workerId, bedId, activityName) — no quantity
+      // parameter; quantity/notes are only collected at completion.
+      const res = await apiPost('start-activity', {
+        bedId: SELECTED_BED.Bed_ID,
+        activityName: SELECTED_ACTIVITY.name
       });
-      if(!res.success){ toast(res.error || 'Could not start task', true); return; }
-      sessionId = res.session_id;
+      if(!res.ok){ toast(res.error || 'Could not start task', true); return; }
+      // ActivityEngine.gs's return shape for startActivity() wasn't provided,
+      // so this checks the common field names rather than assuming one.
+      const data = res.data || {};
+      sessionId = data.sessionId || data.Session_ID || data.id || sessionId;
     } catch(err){ toast('Start failed: ' + err.message, true); return; }
+  } else if(ONLINE && !AUTH_TOKEN){
+    toast('Signed in offline — reconnect and sign in again to start real tasks', true); return;
   }
   ACTIVE_SESSION = {
     Session_ID: sessionId, Worker_ID: CURRENT_USER.Worker_ID, Bed_ID: SELECTED_BED.Bed_ID,
@@ -613,26 +597,24 @@ function startTimer(){
     if(el) el.textContent = fmtElapsed(elapsedSeconds(ACTIVE_SESSION));
   }, 1000);
 }
-async function togglePauseResume(){
+function togglePauseResume(){
+  // No pause-session/resume-session action exists on the backend, so this
+  // only affects the on-screen timer — the server never learns a task was
+  // paused. It will show as running the whole time in any manager view.
   if(!ACTIVE_SESSION) return;
   const paused = (ACTIVE_SESSION.Status||'').toUpperCase() === 'PAUSED';
-  const action = paused ? 'resume-session' : 'pause-session';
-  if(ONLINE){
-    try{
-      const res = await apiPost(action, {session_id: ACTIVE_SESSION.Session_ID});
-      if(!res.success){ toast(res.error || 'Action failed', true); return; }
-    } catch(err){ toast('Action failed: ' + err.message, true); return; }
-  }
   ACTIVE_SESSION.Status = paused ? 'ACTIVE' : 'PAUSED';
   renderActiveSession();
 }
 function openCompleteModal(){
   $('completeQtySection').style.display = 'none';
   $('completeNotesInput').value = '';
+  COMPLETE_UNIT = '';
   const act = (SNAPSHOT.ACTIVITY_REFERENCE || []).find(a => a.Activity_Name === ACTIVE_SESSION.Activity_Name);
   if(act && act.Is_Quantity_Based){
+    COMPLETE_UNIT = act.Default_Unit || '';
     $('completeQtySection').style.display = 'block';
-    $('completeQtyLabel').textContent = 'Quantity' + (act.Default_Unit ? ' (' + act.Default_Unit + ')' : '');
+    $('completeQtyLabel').textContent = 'Quantity' + (COMPLETE_UNIT ? ' (' + COMPLETE_UNIT + ')' : '');
     $('completeQtyInput').value = '';
   }
   $('completeModal').classList.add('active');
@@ -640,12 +622,28 @@ function openCompleteModal(){
 async function confirmComplete(){
   const qty = $('completeQtyInput').value;
   const notes = $('completeNotesInput').value;
-  if(ONLINE){
+  if(ONLINE && AUTH_TOKEN){
     try{
-      const res = await apiPost('complete-session', {session_id: ACTIVE_SESSION.Session_ID, quantity: qty, notes});
-      if(!res.success){ toast(res.error || 'Could not complete', true); return; }
+      // completeActivity(sessionId, quantity, unit, notes, isFinalHarvest).
+      // isFinalHarvest is left false here — nothing in the UI distinguishes
+      // "last harvest of this cohort" yet.
+      const res = await apiPost('end-activity', {
+        sessionId: ACTIVE_SESSION.Session_ID,
+        quantity: qty,
+        unit: COMPLETE_UNIT,
+        notes: notes,
+        isFinalHarvest: false
+      });
+      if(!res.ok){ toast(res.error || 'Could not complete', true); return; }
     } catch(err){ toast('Complete failed: ' + err.message, true); return; }
+  } else if(ONLINE && !AUTH_TOKEN){
+    toast('Signed in offline — this will not be saved to the server', true);
   }
+  LOCAL_HISTORY.unshift({
+    Bed_ID: ACTIVE_SESSION.Bed_ID, Activity_Name: ACTIVE_SESSION.Activity_Name,
+    Start_Time: ACTIVE_SESSION.Start_Time, Quantity: qty, Unit: COMPLETE_UNIT,
+    Elapsed_Minutes: Math.round(elapsedSeconds(ACTIVE_SESSION) / 60)
+  });
   $('completeModal').classList.remove('active');
   OPEN_SESSIONS = OPEN_SESSIONS.filter(s => s.Session_ID !== ACTIVE_SESSION.Session_ID);
   clearInterval(TIMER_HANDLE);
@@ -657,33 +655,25 @@ function openExceptionModal(){
   $('exceptionNotesInput').value = '';
   $('exceptionModal').classList.add('active');
 }
-async function confirmException(){
-  const type = $('exceptionTypeInput').value;
-  const notes = $('exceptionNotesInput').value;
-  if(ONLINE){
-    try{
-      const res = await apiPost('flag-exception', {session_id: ACTIVE_SESSION.Session_ID, exception_type: type, notes});
-      if(!res.success){ toast(res.error || 'Could not flag exception', true); return; }
-    } catch(err){ toast('Flag failed: ' + err.message, true); return; }
-  }
+function confirmException(){
+  // There is no 'flag-exception' (or equivalent worker-facing) action in
+  // Auth.gs's AUTH_POLICY or Code_main.gs's routeAction_ — only a
+  // manager-only 'resolve-exception' for closing existing exceptions
+  // exists. Nothing here reaches the server; a matching write action and
+  // policy entry need to be added to the backend before this can sync.
   $('exceptionModal').classList.remove('active');
-  toast('Exception logged for a manager to review');
+  toast('Exception noted here only — not yet sent (no backend action exists for this)', true);
 }
 
 // ============================================================
 // Completed history
 // ============================================================
-async function goHistory(){
+function goHistory(){
   showScreen('screen-history');
-  let rows = [];
-  if(ONLINE){
-    try{
-      const res = await apiGet('session-history', {worker_id: CURRENT_USER.Worker_ID});
-      rows = res.history || [];
-    } catch(err){ rows = []; }
-  } else {
-    rows = (SNAPSHOT.FIELD_ACTIVITY_LOG || []).filter(r => r.Worker_ID === CURRENT_USER.Worker_ID);
-  }
+  // No worker-facing history action exists ('get-activity-history' is
+  // Manager/Founder-only), so this only shows what was completed on this
+  // device since it was last loaded.
+  const rows = LOCAL_HISTORY;
   const body = $('historyBody');
   if(rows.length === 0){
     body.innerHTML = `<div class="empty"><span class="icon">&#128209;</span>No completed tasks on file yet.</div>`;
