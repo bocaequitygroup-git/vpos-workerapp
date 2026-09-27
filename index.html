@@ -343,6 +343,43 @@ async function loadAssignedTasks(){
  render();
 }
 function startAssignedTask(bedId){selectBed(bedId);}
+
+/* ---- Live session sync (fixes: a session reassigned to this worker from another
+ * device/worker never appeared here, since "My Active Sessions" is built from THIS
+ * device's own localStorage -- see allSessions()/loadForMe() above -- and a session
+ * started on one phone that gets reassigned to a different worker has never been
+ * written to that worker's phone's localStorage at all. Backend now exposes
+ * 'get-my-sessions' (auth.workerId-scoped read of FIELD_LIVE_SESSION, see
+ * Code_main.gs) for exactly this gap. Same merge pattern as loadAssignedTasks():
+ * a session this device already knows about is left untouched (its totes/
+ * pauseReason are richer than what a raw FIELD_LIVE_SESSION row carries) -- this
+ * only ADDS a session this device has never seen before. */
+async function loadMySessions(){
+ if(!st.me)return;
+ const r=await api('get-my-sessions',{});
+ if(handleAuthError(r))return;
+ if(!r.ok)return; // quiet, same as loadAssignedTasks() -- background sync, not worker-initiated
+ const local=allSessions();
+ const localIds=new Set(local.map(s=>s.id));
+ let changed=false;
+ (r.data||[]).forEach(row=>{
+  if(row.Status==='COMPLETED'||localIds.has(row.Session_ID))return;
+  const act=ACTIVITIES.find(a=>a.name===row.Activity_Name)||{};
+  const pauses=String(row['Pause_Time(s)']||'').split(',').map(s=>s.trim()).filter(Boolean);
+  const resumes=String(row['Resume_Time(s)']||'').split(',').map(s=>s.trim()).filter(Boolean);
+  let totalPausedMs=0,pausedAt=null;
+  pauses.forEach((p,i)=>{
+   const pAt=new Date(p).getTime(),rAt=resumes[i]?new Date(resumes[i]).getTime():null;
+   if(rAt)totalPausedMs+=Math.max(0,rAt-pAt);else pausedAt=pAt;
+  });
+  local.push({id:row.Session_ID,workerId:st.me.workerId,bedId:row.Bed_ID,block:bedBlock(row.Bed_ID),
+   activityId:act.id||null,activityName:row.Activity_Name,qtyBased:!!act.qtyBased,unit:act.unit||'',
+   status:row.Status==='PAUSED'?'paused':'active',startTime:new Date(row.Start_Time).getTime(),
+   totalPausedMs:totalPausedMs,pausedAt:pausedAt,pauseReason:null,totes:[]});
+  changed=true;
+ });
+ if(changed){saveSessions(local);loadForMe();render();}
+}
 function fmt(ms){if(ms<0)ms=0;let s=Math.floor(ms/1000);const h=Math.floor(s/3600);s-=h*3600;const m=Math.floor(s/60);s-=m*60;
 return(h>0?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
 function elapsed(s){const paused=s.totalPausedMs||0;if(s.status==='paused')return s.pausedAt-s.startTime-paused;
@@ -372,7 +409,7 @@ try{
  if(sess&&sess.token&&sess.me){st.me=sess.me;st.token=sess.token;st.screen='home';st.connected=true;}
 }catch(e){}
 function loadForMe(){st.sessions=allSessions().filter(s=>s.workerId===st.me.workerId).sort((a,b)=>b.startTime-a.startTime);}
-if(st.me){loadForMe();loadAssignedTasks();}
+if(st.me){loadForMe();loadAssignedTasks();loadMySessions();}
 
 function go(screen){st.screen=screen;st.err=null;render();}
 
@@ -388,7 +425,7 @@ async function attemptLogin(){
  st.token=r.data.token;
  localStorage.setItem('vpos_session',JSON.stringify({me:st.me,token:st.token}));
  st.workerIdInput='';st.pinInput='';
- loadForMe();go('home');loadAssignedTasks();
+ loadForMe();go('home');loadAssignedTasks();loadMySessions();
 }
 function doLogout(callServer){
  if(callServer!==false && st.token) api('logout',{device:(navigator.userAgent||'').slice(0,100)});
@@ -679,7 +716,7 @@ function renderHome(){
  const tasks=assignedTasks();
  return `${header()}
  <div class="row" style="margin-bottom:2px;"><h1 style="flex:2;">My Active Sessions</h1>
- <button class="btn secondary" style="flex:1;" onclick="loadForMe();loadAssignedTasks();render()">Refresh</button></div>
+ <button class="btn secondary" style="flex:1;" onclick="loadForMe();loadAssignedTasks();loadMySessions();render()">Refresh</button></div>
  <p class="sub" style="margin:0 0 10px;">Logged in as ${esc(st.me.name)} (${esc(shortName(st.me.name))})</p>
  ${errBanner()}
  ${tasks.length?`
@@ -812,39 +849,4 @@ function renderAssignment(){
  <p class="link" onclick="go('scan')" style="margin-top:0;">‹ Cancel / Rescan</p>
  <h1>Confirm Assignment</h1>
  <div class="card">
-  <div style="font-weight:700;font-size:16px;">📍 Bed ${esc(d.bedId)} <span class="sub" style="font-weight:400;">(Block ${esc(d.block)}${d.zone?' · Zone '+esc(d.zone):''})</span></div>
-  <div class="detail-row">🌱 Crop: ${d.cropName?esc(d.cropName):'—'}</div>
-  <div class="detail-row">🏷️ Cohort: ${d.cohortId?esc(d.cohortId):'—'}</div>
-  <div class="detail-row">📋 Field Status: ${esc(d.status)}</div>
-  ${d.cohortId?`
-  <div class="detail-row">🔄 Stage: ${d.stage?esc(d.stage)+(d.cropDay?' · Day '+d.cropDay:''):'—'}</div>
-  <div class="detail-row">📅 Planted: ${d.plantingDate?esc(fmtDate_(d.plantingDate)):'Not yet planted'}</div>
-  <div class="detail-row">🌾 Harvest est.: ${d.harvestStart?esc(fmtDate_(d.harvestStart))+' – '+esc(fmtDate_(d.harvestEnd)):'—'}</div>`:''}
-  <p class="link" style="margin-top:10px;margin-bottom:0;" onclick="st.showHistory=!st.showHistory;render()">${st.showHistory?'▾':'▸'} Bed History</p>
-  ${st.showHistory?bedHistoryHtml(d.bedId):''}
- </div>
- ${errBanner()}
- <h1 style="font-size:16px;margin-top:16px;">Field Actions</h1>
- <div class="qa-grid">${quick}</div>
- <p class="link" onclick="st.showAllActs=!st.showAllActs;render()">${st.showAllActs?'▾':'▸'} Or Choose Any Activity</p>
- ${st.showAllActs?`<div class="act-groups">${actGroupsHtml()}</div>`:''}
- ${branch==='planting'&&needsCropPick()?cropPickerHtml():''}
- ${branch==='harvest'?harvestWindowHtml():''}
- <button class="btn block" style="margin-top:10px;" ${canStart()?'':'disabled'} onclick="confirmStart()">${st.busy?'Starting…':(needsCropPick()&&!st.selCrop?'Pick a crop first':'▶ Start Task')}</button>
- <button class="btn secondary block" style="margin-top:8px;" onclick="go('scan')">Cancel / Rescan</button>
- <p class="link" onclick="go('home')">‹ Back to My Sessions</p>`;
-}
-
-function render(){
- const el=document.getElementById('app');
- if(st.screen==='login')el.innerHTML=renderLogin();
- else if(st.screen==='home')el.innerHTML=renderHome();
- else if(st.screen==='scan')el.innerHTML=renderScan();
- else if(st.screen==='assignment')el.innerHTML=renderAssignment();
- if(tickTimer)clearInterval(tickTimer);
- if(st.screen==='home'&&st.sessions.some(s=>s.status==='active'))tickTimer=setInterval(render,1000);
-}
-render();
-</script>
-</body>
-</html>
+  <div style="font-weight:700;font-size:16px;">📍 Bed ${esc(d.bedId)} 
